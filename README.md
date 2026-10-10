@@ -64,6 +64,50 @@ Notes:
   environment (as with `pm2-runtime` in Docker).
 * The `proxy` option from upstream is not supported.
 
+### `PM2_APP_NAME` and `PM2_MACHINE_NAME`
+
+Prodman organises everything as **servers** that run **processes**, and lists **applications**
+by grouping processes with the same name across servers. Under PM2, the server is the machine
+and its PM2 agent, and the process names are the app names in PM2. A standalone app has no PM2,
+so these two variables supply both:
+
+* **`PM2_APP_NAME`** is the **application name**. It is the name of the one process the app
+  reports, so it is what appears under **Applications** and in app-level views (metrics, logs,
+  issues, events, actions). Copies of the same app on different hosts or containers should all
+  use the same `PM2_APP_NAME`, so prodman shows them as instances of one application.
+* **`PM2_MACHINE_NAME`** is the **server name**. It is the entry under **Servers**, and the
+  identity of the connection (`X-KM-SERVER`). Prodman keeps one live connection per server name,
+  so every running copy needs a different one. A second copy with the same name replaces the
+  first, and the two keep taking over from each other. When it is not set, the name is
+  `<PM2_APP_NAME>@<hostname>`, which is unique as long as only one copy runs per host or
+  container.
+
+For example, two ECS tasks of `orders-api` appear as servers `orders-api@ip-10-0-1-12` and
+`orders-api@ip-10-0-2-34`, and as one application `orders-api` with 2 instances.
+
+### Not seeing the app under its `PM2_APP_NAME`?
+
+The app is listed under `PM2_APP_NAME` only when the library actually runs in standalone mode.
+Otherwise `PM2_APP_NAME` is ignored. Check:
+
+1. **Is the app run by PM2?** Under PM2 (`pm_id` is set) the library always reports through the
+   PM2 daemon, and the app is listed under its **PM2 name** (`name` in the ecosystem file, or
+   `pm2 start app.js --name …`), on the machine's server. Rename it there; `PM2_APP_NAME` has no
+   effect under PM2.
+2. **Are all three of `PM2_PUBLIC_KEY`, `PM2_SECRET_KEY` and `PM2_APP_NAME` set** in the app's own
+   environment (not just your shell) **before `@pm2/io` is first required**? Requiring it starts it
+   from the environment. With one of them missing, standalone mode stays off (the library prints a
+   warning naming the missing variables).
+3. **Is it this fork?** Upstream `@pm2/io` from npm has no prodman transport and silently does
+   nothing outside PM2. `require('@pm2/io/package.json').version` should be 7.x. Only one copy of
+   `@pm2/io` runs per process (the first one loaded is shared), so a dependency that pulls in
+   upstream `@pm2/io` and loads it first wins. Check with `npm ls @pm2/io`.
+4. **Did it connect?** A wrong URL keeps it retrying quietly, and wrong keys print
+   `[@pm2/io] prodman refused the connection`. Run with `DEBUG=axm:transport:prodman` to see the
+   handshake, the URL it uses (`PRODMAN_URL`, default `http://localhost:8070`) and the server name.
+5. **Look under Servers too.** The app's server is `PM2_MACHINE_NAME` (or `<PM2_APP_NAME>@<hostname>`).
+   If it is there but flapping, two copies share a server name; give each its own `PM2_MACHINE_NAME`.
+
 ---
 
 The [@pm2/io](https://github.com/keymetrics/pm2-io-apm/tree/master/test) module comes along with PM2. It is the PM2 library responsible for gathering the metrics, reporting exceptions, exposing remote actions and every interaction with your application.

@@ -105,6 +105,12 @@ export default class PMX {
       }
       if (!config.standalone) {
         config.standalone = !!(fromEnv.secretKey && fromEnv.publicKey && fromEnv.appName)
+        // some but not all set: almost certainly meant to report standalone, so say why it won't
+        const vars = { PM2_PUBLIC_KEY: fromEnv.publicKey, PM2_SECRET_KEY: fromEnv.secretKey, PM2_APP_NAME: fromEnv.appName }
+        const missing = Object.keys(vars).filter(k => !vars[k])
+        if (missing.length > 0 && missing.length < 3) {
+          console.warn(`[@pm2/io] not reporting to prodman: ${missing.join(', ')} not set (standalone mode needs PM2_PUBLIC_KEY, PM2_SECRET_KEY and PM2_APP_NAME)`)
+        }
       }
       // options given to init() win over the environment
       config.apmOptions = config.standalone
