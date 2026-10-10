@@ -20,10 +20,10 @@ This fork of `@pm2/io` reports to a [prodman](https://github.com/westonpark/prod
   channels (prodman `docs/agent-protocol.md`), so the app appears in prodman's Servers and
   Apps with its metrics, actions (including CPU/heap profiling), events, exceptions and logs.
 
-Install it from GitHub (it builds on install):
+Install it from GitHub (it builds on install; npm 12+ needs `--allow-git=root` to fetch from git):
 
 ```bash
-npm install github:westonpark/pm2-io-apm
+npm install --allow-git=root github:westonpark/pm2-io-apm
 ```
 
 Standalone mode starts automatically when the bucket keys and an app name are set, and the
