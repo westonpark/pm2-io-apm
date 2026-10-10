@@ -2,10 +2,15 @@
 import { Action } from './actions'
 import { Metric, InternalMetric } from './metrics'
 import { IPCTransport } from '../transports/IPCTransport'
-// import { WebsocketTransport } from '../transports/WebsocketTransport'
+import { ProdmanTransport } from '../transports/ProdmanTransport'
 import { EventEmitter2 } from 'eventemitter2'
 
 export class TransportConfig {
+  /**
+   * prodman: base URL of the prodman server (standalone mode).
+   * Default: PRODMAN_URL, then KEYMETRICS_NODE, then http://localhost:8070
+   */
+  url?: string
   /**
    * public key of the bucket to which the agent need to connect
    */
@@ -19,9 +24,10 @@ export class TransportConfig {
    */
   appName: string
   /**
-   * The name of the server as reported in PM2 Enterprise
+   * The name this process appears under in prodman's Servers. Each standalone process needs
+   * its own name (prodman keeps one connection per name).
    *
-   * default is os.hostname()
+   * default is PM2_MACHINE_NAME, else "<appName>@<hostname>"
    */
   serverName?: string
   /**
@@ -39,14 +45,6 @@ export class TransportConfig {
    * when going to the log interface (it automatically trigger broacasting log)
    */
   disableLogs?: Boolean
-  /**
-   * Proxy URI to use when reaching internet
-   * Supporting socks5,http,https,pac,socks4
-   * see https://github.com/TooTallNate/node-proxy-agent
-   *
-   * example: socks5://username:password@some-socks-proxy.com:9050
-   */
-  proxy?: string
 }
 
 export interface Transport extends EventEmitter2 {
@@ -80,21 +78,8 @@ export interface Transport extends EventEmitter2 {
  * Init a transporter implementation with a specific config
  */
 export function createTransport (name: string, config: TransportConfig): Transport {
-  const transport = new IPCTransport()
+  // prodman: 'websocket' (standalone) reports straight to a prodman server
+  const transport: Transport = name === 'websocket' ? new ProdmanTransport() : new IPCTransport()
   transport.init(config)
   return transport
-  // switch (name) {
-  //   case 'ipc': {
-  //     const transport = new IPCTransport()
-  //     transport.init(config)
-  //     return transport
-  //   }
-  //   case 'websocket': {
-  //     const transport = new WebsocketTransport()
-  //     transport.init(config)
-  //     return transport
-  //   }
-  // }
-  // console.error(`Failed to find transport implementation: ${name}`)
-  // return process.exit(1)
 }

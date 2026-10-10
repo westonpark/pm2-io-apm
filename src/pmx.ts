@@ -40,7 +40,7 @@ export class IOConfig {
    */
   profiling?: ProfilingConfig | boolean = true
   /**
-   * If you want to connect to PM2 Enterprise without using PM2, you should enable
+   * prodman: to report straight to a prodman server without PM2, enable
    * the standalone mode
    */
   standalone?: boolean = false
@@ -92,14 +92,24 @@ export default class PMX {
     if (config === undefined) {
       config = defaultConfig
     }
-    if (!config.standalone) {
-      const autoStandalone = process.env.PM2_SECRET_KEY && process.env.PM2_PUBLIC_KEY && process.env.PM2_APP_NAME
-      config.standalone = !!autoStandalone
-      config.apmOptions = autoStandalone ? {
+    // prodman: under PM2 the daemon's agent reports for us, over IPC, even when the PM2_* keys
+    // are in the environment (pm2-runtime links with them)
+    const underPM2 = process.env.pm_id !== undefined && typeof process.send === 'function'
+    if (underPM2) {
+      config.standalone = false
+    } else {
+      const fromEnv = {
         secretKey: process.env.PM2_SECRET_KEY,
         publicKey: process.env.PM2_PUBLIC_KEY,
         appName: process.env.PM2_APP_NAME
-      } as TransportConfig : undefined
+      }
+      if (!config.standalone) {
+        config.standalone = !!(fromEnv.secretKey && fromEnv.publicKey && fromEnv.appName)
+      }
+      // options given to init() win over the environment
+      config.apmOptions = config.standalone
+        ? Object.assign(fromEnv, config.apmOptions || {}) as TransportConfig
+        : undefined
     }
 
     // Register the transport before any other service

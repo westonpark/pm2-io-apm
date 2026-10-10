@@ -9,9 +9,66 @@
 </div>
 
 
+## Prodman
+
+This fork of `@pm2/io` reports to a [prodman](https://github.com/westonpark/prodman) server.
+
+* **Apps run by PM2 (pm2_prodman):** nothing changes. The library talks to the PM2 daemon over
+  IPC and the daemon's agent forwards everything to prodman.
+* **Apps run without PM2** (a container's `node app.js`, ECS tasks, workers): the library connects
+  to prodman itself, as a one-process PM2 agent. It uses the same handshake, WebSocket and
+  channels (prodman `docs/agent-protocol.md`), so the app appears in prodman's Servers and
+  Apps with its metrics, actions (including CPU/heap profiling), events, exceptions and logs.
+
+Install it from GitHub (it builds on install):
+
+```bash
+npm install github:westonpark/pm2-io-apm
+```
+
+Standalone mode starts automatically when the bucket keys and an app name are set, and the
+process isn't run by PM2:
+
+```bash
+PRODMAN_URL=https://prodman.example.com \
+PM2_PUBLIC_KEY=<public key> PM2_SECRET_KEY=<secret key> PM2_APP_NAME=orders-api \
+node app.js
+```
+
+```js
+const io = require('@pm2/io')
+io.init({ apmOptions: { sendLogs: true } })   // or set everything here, see below
+```
+
+| Setting (`apmOptions`) | Environment | Default |
+|---|---|---|
+| `url` | `PRODMAN_URL` (then `KEYMETRICS_NODE`) | `http://localhost:8070` |
+| `publicKey`, `secretKey` | `PM2_PUBLIC_KEY`, `PM2_SECRET_KEY` | required (Bucket settings → Connect) |
+| `appName` | `PM2_APP_NAME` | required |
+| `serverName` | `PM2_MACHINE_NAME` | `<appName>@<hostname>` |
+| `sendLogs` | | `false`; logs are also sent while the bucket's "collect logs" is on |
+| `disableLogs` | | `false`; `true` never captures stdout/stderr |
+| `logFilter` | | lines containing this string, or matching this RegExp, are not sent |
+
+Notes:
+
+* Each standalone process needs its own server name, because prodman keeps one connection per
+  name. The default `<appName>@<hostname>` is unique per container; set `PM2_MACHINE_NAME` when
+  several copies of an app share a host.
+* PM2-only remote commands (restart, reload, stop…) answer with an error, since there is no PM2
+  to carry them out. `ping` works, and "Logs" shows the last 200 lines the app printed.
+* The connection never keeps the app alive: it exits when its own work is done.
+* It retries forever, with backoff, if prodman is unreachable or the keys are wrong, and
+  queues the last 200 events while disconnected.
+* Inside PM2 (`pm_id` set) the library always uses IPC, even if the `PM2_*` keys are in the
+  environment (as with `pm2-runtime` in Docker).
+* The `proxy` option from upstream is not supported.
+
+---
+
 The [@pm2/io](https://github.com/keymetrics/pm2-io-apm/tree/master/test) module comes along with PM2. It is the PM2 library responsible for gathering the metrics, reporting exceptions, exposing remote actions and every interaction with your application.
 
-You can also use it as a standalone agent, if you want to connect your nodejs process to PM2 Enterprise but without having to launch your application with PM2.
+You can also use it as a standalone agent, to connect your Node.js process to prodman without launching it with PM2 (see [Prodman](#prodman)).
 
 # Table of Contents
 
@@ -451,16 +508,20 @@ export class IOConfig {
     createSpanWithNet: boolean
   }
   /**
-   * If you want to connect to PM2 Enterprise without using PM2, you should enable
-   * the standalone mode
+   * Report straight to a prodman server without PM2 (see Prodman above).
    *
-   * default is false
+   * default is false, or true when PM2_PUBLIC_KEY, PM2_SECRET_KEY and PM2_APP_NAME are set
+   * and the process is not run by PM2
    */
   standalone?: boolean = false
   /**
    * Define custom options for the standalone mode
    */
   apmOptions?: {
+    /**
+     * Base URL of the prodman server (default PRODMAN_URL, KEYMETRICS_NODE, http://localhost:8070)
+     */
+    url?: string
     /**
      * public key of the bucket to which the agent need to connect
      */
@@ -474,9 +535,9 @@ export class IOConfig {
      */
     appName: string
     /**
-     * The name of the server as reported in PM2 Enterprise
+     * The name this process appears under in prodman's Servers
      *
-     * default is os.hostname()
+     * default is PM2_MACHINE_NAME, else "<appName>@<hostname>"
      */
     serverName?: string
     /**
@@ -494,14 +555,6 @@ export class IOConfig {
      * logs (containing sensitive data for example)
      */
     logFilter?: string | RegExp
-    /**
-     * Proxy URI to use when reaching internet
-     * Supporting socks5,http,https,pac,socks4
-     * see https://github.com/TooTallNate/node-proxy-agent
-     *
-     * example: socks5://username:password@some-socks-proxy.com:9050
-     */
-    proxy?: string
   }
 }
 ```

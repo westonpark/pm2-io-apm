@@ -1,12 +1,12 @@
 {
   "name": "@pm2/io",
-  "version": "6.1.0",
-  "description": "PM2.io NodeJS APM",
+  "version": "7.0.0",
+  "description": "PM2 APM for Node.js, reporting to prodman",
   "main": "build/main/index.js",
   "typings": "build/main/index.d.ts",
   "types": "build/main/index.d.ts",
   "module": "build/module/index.js",
-  "repository": "https://github.com/keymetrics/pm2-io-apm",
+  "repository": "https://github.com/westonpark/pm2-io-apm",
   "author": {
     "name": "PM2.io tech team",
     "email": "tech@pm2.io",
@@ -27,7 +27,8 @@
     "mono": "mocha  --exit --require ts-node/register",
     "test": "if command -v bun >/dev/null 2>&1; then bun run unit; else npm run unit; fi",
     "watch": "tsc -w",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "tsc -p tsconfig.json"
   },
   "scripts-info": {
     "build": "(Trash and re)build the library",
@@ -47,6 +48,7 @@
     "@types/mongodb": "~3.1.19",
     "@types/node": "~10.12.21",
     "@types/redis": "~2.8.10",
+    "@types/ws": "^8.18.2",
     "chai": "4.1.2",
     "express": "^4.17.1",
     "ioredis": "^4.16.3",
@@ -89,6 +91,7 @@
     "semver": "~7.5.4",
     "shimmer": "^1.2.0",
     "signal-exit": "^3.0.3",
-    "tslib": "1.9.3"
+    "tslib": "1.9.3",
+    "ws": "^8.22.0"
   }
 }

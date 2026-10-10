@@ -18,8 +18,7 @@ $MOCHA ./test/api.spec.ts
 $MOCHA ./test/metrics/http.spec.ts
 $MOCHA ./test/metrics/runtime.spec.ts
 $MOCHA ./test/entrypoint.spec.ts
-# $MOCHA ./test/standalone/tracing.spec.ts
-# $MOCHA ./test/standalone/events.spec.ts
+$MOCHA ./test/standalone/prodman.spec.ts
 $MOCHA ./test/features/events.spec.ts
 $MOCHA ./test/features/tracing.spec.ts
 $MOCHA ./test/metrics/eventloop.spec.ts
