@@ -1,5 +1,5 @@
 import { Transport, TransportConfig } from '../services/transport'
-import * as Debug from 'debug'
+import Debug from 'debug'
 import { Action } from '../services/actions'
 import { InternalMetric } from '../services/metrics'
 import { EventEmitter2 } from 'eventemitter2'
@@ -10,6 +10,7 @@ import * as http from 'http'
 import * as https from 'https'
 import * as crypto from 'crypto'
 import { URL } from 'url'
+import { ContainerInfo, ContainerMetrics, Limits, SysRoot, serverNameFor, hostname } from '../utils/container'
 
 /**
  * prodman: standalone transport. An app that is not run by PM2 (a container, `node app.js`,
@@ -26,6 +27,9 @@ import { URL } from 'url'
  *  - logs: stdout/stderr are forwarded when `sendLogs` is set or the bucket collects logs,
  *    unless `disableLogs`; recent lines are kept for exceptions and `getLogs`
  *  - sockets and timers are unref'd, so the transport never keeps the app alive
+ *  - containers (pmx 95 §1–§4, prodman 11 §5): detection and identity, `<service>@<instance>`
+ *    server names, the `container` block, `ephemeral`, cgroup-aware server metrics
+ *  - planned shutdowns: `agent:shutdown` on SIGTERM/SIGINT, normal end, crash and destroy()
  */
 
 export const DEFAULT_URL = 'http://localhost:8070'
@@ -34,6 +38,14 @@ const PING_INTERVAL = 5000
 const PONG_TIMEOUT = 20000
 const MAX_QUEUE = 200
 const LOG_BUFFER = 200
+/** APM-082: how long the first handshake waits for container detection (ECS metadata) */
+const DETECT_WAIT = 1500
+/** CTR-010: each ECS metadata request */
+const ECS_TIMEOUT = 1000
+/** APM-085 / CTR-022 Mode S: flush limit before the close */
+const SHUTDOWN_FLUSH = 1000
+const SHUTDOWN_POLL = 10
+export const AGENT_KIND = '@pm2/io'
 
 /** prodman base URL: config → PRODMAN_URL → KEYMETRICS_NODE → localhost:8070 */
 export function resolveUrl (configured?: string): string {
@@ -46,9 +58,27 @@ export function resolveUrl (configured?: string): string {
   return url.replace(/\/+$/, '')
 }
 
-/** name of this instance in prodman: one prodman server per standalone process */
-export function defaultServerName (appName: string): string {
-  return process.env.PM2_MACHINE_NAME || `${appName}@${os.hostname()}`
+/**
+ * name of this instance in prodman: one prodman server per standalone process (APM-083):
+ * `PM2_MACHINE_NAME` (placeholders expanded), else `<service>@<instance>` in a container and
+ * `<appName>@<hostname>` outside
+ */
+export function defaultServerName (appName: string, info?: ContainerInfo): string {
+  return serverNameFor(info || ContainerInfo.detect(), appName, null)
+}
+
+export type ShutdownReason = 'signal' | 'exit' | 'crash' | 'stop'
+
+/** signal-exit's own signal listeners (used by io.onExit) are not "the application's" */
+function isSignalExitListener (fn: any): boolean {
+  const g: any = global
+  const present = !!((process as any).__signal_exit_emitter__ || g[Symbol.for('signal-exit emitter')])
+  return present && typeof fn === 'function' && fn.name === 'listener'
+}
+
+function signalNumber (sig: string): number {
+  const n = (os.constants && (os.constants.signals as any)[sig]) || (sig === 'SIGINT' ? 2 : 15)
+  return n
 }
 
 function ioVersion (): string {
@@ -86,6 +116,17 @@ function unref (t: any) {
 
 type Handshake = { ws: string, collectLogs: boolean }
 
+type ShutdownState = {
+  packet: { at: number, reason: ShutdownReason, signal: string | null, planned: boolean }
+  /** the sockets the packet went out on (once per connection) */
+  sentOn: any[]
+  done: boolean
+  keepAlive: boolean
+  deadline: any
+  poll: any
+  callbacks: Function[]
+}
+
 export class ProdmanTransport extends EventEmitter2 implements Transport {
   private logger: Function = Debug('axm:transport:prodman')
   private config: TransportConfig
@@ -109,6 +150,14 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
   private hostCpuPrev: { idle: number, total: number } | null = null
   private version: string = ioVersion()
   private appVer: string | null = appVersion()
+  private container: ContainerInfo
+  private containerMetrics: ContainerMetrics | null = null
+  private detecting: boolean = false
+  private nameFixed: boolean = false
+  private shutdownState: ShutdownState | null = null
+  /** set once a shutdown finished: no reconnects */
+  private stopped: boolean = false
+  private hooks: { [event: string]: Function } = {}
 
   /** what PM2 would know about this process */
   private proc = {
@@ -128,19 +177,63 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
     this.initiated = true
     this.config = config
     this.url = resolveUrl(config.url)
-    this.serverName = config.serverName || defaultServerName(config.appName)
+    // APM-081: detection once, at init (files and environment only; ECS metadata below)
+    this.container = ContainerInfo.detect(process.env, SysRoot.host(process.env), process.platform === 'linux')
+    if (this.container.inContainer()) this.containerMetrics = new ContainerMetrics(this.container)
+    this.serverName = serverNameFor(this.container, config.appName, config.serverName)
     if (config.disableLogs !== true) this.hookStd()
-    this.logger(`Standalone mode: ${config.appName} reports to ${this.url} as ${this.serverName}`)
-    this.connect()
+    this.installShutdownHooks()
+    if (this.container.ecsPending()) {
+      // APM-082: the first handshake waits for the metadata, at most 1.5 s; the app never does
+      this.detecting = true
+      const ready = () => {
+        if (!this.detecting) return
+        this.detecting = false
+        clearTimeout(this.timers.detect)
+        this.start()
+      }
+      this.timers.detect = unref(setTimeout(ready, DETECT_WAIT))
+      this.container.fetchEcs(ECS_TIMEOUT, (errors) => {
+        errors.forEach(e => this.logger(e))
+        ready()
+      })
+    } else {
+      this.start()
+    }
     return this
+  }
+
+  private start () {
+    if (this.destroyed || this.stopped) return
+    if (!this.nameFixed) {
+      this.nameFixed = true
+      this.serverName = serverNameFor(this.container, this.config.appName, this.config.serverName)
+    }
+    const c = this.container.detection
+    this.logger(`Standalone mode: ${this.config.appName} reports to ${this.url} as ${this.serverName}` +
+      (c.inContainer ? ` (container: ${c.runtime}, ${c.orchestrator})` : ''))
+    this.connect()
+  }
+
+  /** the server name in use (fixed at the first handshake) */
+  getServerName (): string {
+    return this.serverName
+  }
+
+  getContainerInfo (): ContainerInfo {
+    return this.container
+  }
+
+  private limits (): Limits | null {
+    return this.containerMetrics ? this.containerMetrics.limits() : null
   }
 
   // ---------------------------------------------------------------- connection
 
   private connect () {
-    if (this.destroyed) return
+    if (this.destroyed || this.stopped) return
     this.handshake((err, res) => {
-      if (this.destroyed) return
+      if (this.destroyed || this.stopped) return
       if (err || !res) {
         const delay = backoff(this.attempts++, 1000, 60000)
         this.logger(`Handshake failed (${err && err.message}), retrying in ${delay}ms`)
@@ -153,6 +246,10 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
   }
 
   private handshake (cb: (err: Error | null, res?: Handshake) => void) {
+    // in a container, the effective limits (CTR-031, as pmx-io PYI-154)
+    const limits = this.limits()
+    const memory = limits ? limits.memoryBytes : os.totalmem()
+    const cpus = limits ? os.cpus().slice(0, limits.cpusRoundedUp()) : os.cpus()
     const body = JSON.stringify({
       public_id: this.config.publicKey,
       private_id: this.config.secretKey,
@@ -162,9 +259,9 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
         RECYCLE: false,
         PM2_VERSION: null,
         IO_VERSION: this.version,
-        MEMORY: Math.round(os.totalmem() / 1024 / 1024),
+        MEMORY: Math.round(memory / 1024 / 1024),
         HOSTNAME: os.hostname(),
-        CPUS: os.cpus()
+        CPUS: cpus
       }
     })
     let target: URL
@@ -230,6 +327,12 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
       this.flush()
       this.timers.status = unref(setInterval(() => this.sendStatus(), STATUS_INTERVAL))
       this.timers.ping = unref(setInterval(() => this.heartbeat(), PING_INTERVAL))
+      // CTR-022: a shutdown still in progress is announced again on a new connection
+      const st = this.shutdownState
+      if (st && !st.done) {
+        this.sendShutdownPacket()
+        this.flushAndClose()
+      }
     })
     ws.on('pong', () => { this.lastPong = Date.now() })
     ws.on('message', (raw) => {
@@ -242,7 +345,8 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
       if (ws !== this.ws) return
       this.logger(`WebSocket closed (${code})`)
       this.disconnect()
-      if (this.destroyed) return
+      if (this.shutdownState && ws.__pmxShutdownClose) return this.finishShutdown()
+      if (this.destroyed || this.stopped) return
       const delay = backoff(this.attempts++, 5000, 60000)
       this.timers.retry = unref(setTimeout(() => this.connect(), delay))
     })
@@ -424,14 +528,49 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
 
   status () {
     const metric = (value, unit) => ({ value, type: 'metric', unit, historic: true })
-    const system: any = {}
-    const cpu = this.hostCpu()
-    if (cpu !== null) system['CPU Usage'] = metric(cpu, '%')
-    const total = os.totalmem()
-    const free = os.freemem()
-    system['RAM Usage'] = metric(Math.round((1 - free / total) * 1000) / 10, '%')
-    system['RAM Total'] = metric(total, 'b')
-    system['RAM Available'] = metric(free, 'b')
+    let system: any = {}
+    let total = os.totalmem()
+    let cpuCount = os.cpus().length
+    let container: any
+    const limits = this.limits()
+    if (this.containerMetrics && limits) {
+      // CTR-030…033: the container's cgroup and limits, not the node's
+      system = this.containerMetrics.collect(limits)
+      total = limits.memoryBytes
+      cpuCount = limits.cpusRoundedUp()
+      try {
+        container = this.container.block(this.config.appName, hostname(), limits)
+      } catch (e) {
+        container = undefined
+      }
+    } else {
+      const cpu = this.hostCpu()
+      if (cpu !== null) system['CPU Usage'] = metric(cpu, '%')
+      const free = os.freemem()
+      system['RAM Usage'] = metric(Math.round((1 - free / total) * 1000) / 10, '%')
+      system['RAM Total'] = metric(total, 'b')
+      system['RAM Available'] = metric(free, 'b')
+    }
+    const server: any = {
+      username: null,
+      hostname: os.hostname(),
+      uptime: os.uptime(),
+      platform: process.platform,
+      pm2_version: null,
+      pm2_agent_version: `@pm2/io ${this.version}`,
+      agent_kind: AGENT_KIND,
+      ephemeral: this.container ? this.container.ephemeral() : false,
+      node_version: process.version,
+      unique_id: this.uniqueId,
+      loadavg: os.loadavg(),
+      total_mem: total,
+      type: os.type(),
+      arch: process.arch,
+      cpus: cpuCount,
+      cpu_model: (os.cpus()[0] || { model: null }).model,
+      system
+    }
+    if (container) server.container = container
 
     let user: string | null = null
     try { user = os.userInfo().username } catch (e) { user = process.env.USER || null }
@@ -495,23 +634,7 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
             mergeLogs: false
           }
         }],
-        server: {
-          username: user,
-          hostname: os.hostname(),
-          uptime: os.uptime(),
-          platform: process.platform,
-          pm2_version: null,
-          pm2_agent_version: `@pm2/io ${this.version}`,
-          node_version: process.version,
-          unique_id: this.uniqueId,
-          loadavg: os.loadavg(),
-          total_mem: total,
-          type: os.type(),
-          arch: process.arch,
-          cpus: os.cpus().length,
-          cpu_model: (os.cpus()[0] || { model: null }).model,
-          system
-        }
+        server: Object.assign(server, { username: user })
       }
     }
   }
@@ -554,14 +677,196 @@ export class ProdmanTransport extends EventEmitter2 implements Transport {
     }
   }
 
-  destroy () {
-    this.destroyed = true
+  // ---------------------------------------------------------------- shutdown (APM-085…087)
+
+  private installShutdownHooks () {
+    const on = (event: string, fn: Function) => {
+      this.hooks[event] = fn
+      process.on(event as any, fn as any)
+    }
+    // APM-086: one listener each; whether we re-raise depends on the app having its own
+    for (const sig of ['SIGTERM', 'SIGINT']) {
+      try {
+        on(sig, () => this.onSignal(sig))
+      } catch (e) {
+        this.logger(`cannot listen to ${sig}: ${e.message}`)
+      }
+    }
+    // APM-087: the application finished its work
+    on('beforeExit', () => {
+      if (!this.shutdownState) this.shutdown('exit', null, true)
+    })
+    // APM-087: process.exit() can only be observed synchronously: best effort
+    on('exit', (code) => {
+      if (this.shutdownState || !this.connected) return
+      const clean = !code
+      this.shutdownState = this.newShutdownState(clean ? 'exit' : 'crash', null, clean, false)
+      this.sendShutdownPacket()
+      this.shutdownState.done = true
+    })
+  }
+
+  private removeShutdownHooks () {
+    for (const event of Object.keys(this.hooks)) {
+      process.removeListener(event as any, this.hooks[event] as any)
+    }
+    this.hooks = {}
+  }
+
+  private onSignal (sig: string) {
+    const st = this.shutdownState
+    if (st && !st.done) {
+      // a second signal during the flush skips the rest of it
+      this.logger(`${sig} during the shutdown flush: closing now`)
+      return this.finishShutdown()
+    }
+    if (st) return this.afterSignal(sig)
+    this.shutdown('signal', sig, true, () => this.afterSignal(sig))
+  }
+
+  /**
+   * APM-086: without listeners of the application's own, deliver the signal's default action
+   * (re-raise; PID 1 ignores a default SIGTERM, so exit 128 + n instead); otherwise the
+   * application decides when to exit
+   */
+  private afterSignal (sig: string) {
+    const ours = this.hooks[sig]
+    const others = process.listeners(sig as any).filter(l => l !== ours && !isSignalExitListener(l))
+    if (others.length > 0) {
+      this.logger(`${sig}: the application handles it`)
+      return
+    }
+    if (ours) {
+      process.removeListener(sig as any, ours as any)
+      delete this.hooks[sig]
+    }
+    if (process.pid === 1) {
+      process.exit(128 + signalNumber(sig))
+      return
+    }
+    try {
+      process.kill(process.pid, sig)
+    } catch (e) {
+      process.exit(128 + signalNumber(sig))
+    }
+  }
+
+  private newShutdownState (reason: ShutdownReason, signal: string | null, planned: boolean, keepAlive: boolean): ShutdownState {
+    return {
+      packet: { at: Date.now(), reason, signal, planned },
+      sentOn: [],
+      done: false,
+      keepAlive,
+      deadline: null,
+      poll: null,
+      callbacks: []
+    }
+  }
+
+  /**
+   * CTR-022 / APM-085: send `agent:shutdown` (once per connection), flush for at most 1 s, close
+   * with 1000 `Shutting down`, then call `cb`. Without a connection, `cb` runs at once (it is
+   * sent on a connection opened while the process still runs). Returns false when a shutdown
+   * was already under way (`cb` then runs when it ends).
+   */
+  shutdown (reason: ShutdownReason, signal: string | null, planned: boolean, cb?: Function): boolean {
+    if (this.shutdownState) {
+      if (cb) {
+        if (this.shutdownState.done) cb()
+        else this.shutdownState.callbacks.push(cb)
+      }
+      return false
+    }
+    const st = this.newShutdownState(reason, signal, planned, reason !== 'stop')
+    if (cb) st.callbacks.push(cb)
+    this.shutdownState = st
+    this.logger(`Shutdown: ${reason}${signal ? ' ' + signal : ''}`)
+    if (!this.connected || !this.ws) {
+      this.finishShutdown()
+      return true
+    }
+    this.sendShutdownPacket()
+    this.flushAndClose()
+    return true
+  }
+
+  private sendShutdownPacket () {
+    const st = this.shutdownState
+    if (!st || !this.ws || st.sentOn.indexOf(this.ws) > -1) return
+    if (this.raw('agent:shutdown', st.packet)) st.sentOn.push(this.ws)
+  }
+
+  private flushAndClose () {
+    const st = this.shutdownState
+    if (!st || st.done) return
+    const ws = this.ws
+    if (!st.deadline) {
+      const deadline = setTimeout(() => this.finishShutdown(), SHUTDOWN_FLUSH)
+      // the only ref()'d timer: keeps the process alive during the flush (APM-085)
+      if (!st.keepAlive) unref(deadline)
+      st.deadline = deadline
+    }
+    clearInterval(st.poll)
+    st.poll = unref(setInterval(() => {
+      if (!ws || ws !== this.ws) return
+      if (ws.bufferedAmount > 0 || this.queue.length > 0) return
+      clearInterval(st.poll)
+      ws.__pmxShutdownClose = true
+      try {
+        ws.close(1000, 'Shutting down')
+      } catch (e) {
+        this.finishShutdown()
+      }
+    }, SHUTDOWN_POLL))
+  }
+
+  private finishShutdown () {
+    const st = this.shutdownState
+    if (!st || st.done) return
+    st.done = true
+    this.stopped = true
+    clearTimeout(st.deadline)
+    clearInterval(st.poll)
     Object.keys(this.timers).forEach(k => { clearTimeout(this.timers[k]); clearInterval(this.timers[k]) })
     this.disconnect()
     if (this.ws) {
-      try { this.ws.close() } catch (e) { /* already closed */ }
+      const ws = this.ws
       this.ws = null
+      try {
+        if (ws.readyState === 1) {
+          ws.__pmxShutdownClose = true
+          ws.close(1000, 'Shutting down')
+        }
+        // still closing after the flush limit, or never opened: drop it
+        if (ws.readyState !== 3) unref(setTimeout(() => { try { ws.terminate() } catch (e) { /* gone */ } }, 100))
+      } catch (e) { /* closed */ }
     }
+    const cbs = st.callbacks
+    st.callbacks = []
+    for (const cb of cbs) {
+      try { cb() } catch (e) { this.logger(`shutdown callback failed: ${e.message}`) }
+    }
+  }
+
+  destroy () {
+    if (this.destroyed) return
+    this.destroyed = true
+    this.detecting = false
+    this.removeShutdownHooks()
+    // APM-087: only the reporting stops ('stop', planned); the app keeps running
+    if (!this.shutdownState && this.connected && this.ws) {
+      this.shutdown('stop', null, true)
+    } else if (this.shutdownState && !this.shutdownState.done) {
+      // already flushing; let it finish
+    } else {
+      Object.keys(this.timers).forEach(k => { clearTimeout(this.timers[k]); clearInterval(this.timers[k]) })
+      this.disconnect()
+      if (this.ws) {
+        try { this.ws.close() } catch (e) { /* already closed */ }
+        this.ws = null
+      }
+    }
+    Object.keys(this.timers).forEach(k => { clearTimeout(this.timers[k]); clearInterval(this.timers[k]) })
     if (this.restoreStd) this.restoreStd()
     this.restoreStd = null
     this.logger('destroy')

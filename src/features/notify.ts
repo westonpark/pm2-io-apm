@@ -155,7 +155,13 @@ export class NotifyFeature implements Feature {
       ServiceManager.get('transport').send('process:exception', payload)
     }
     if (process.listeners('uncaughtException').length === 1) { // if it's only us, exit
-      process.exit(1)
+      // prodman standalone (APM-087): announce the crash and flush (≤ 1 s) before exiting
+      const transport: any = ServiceManager.get('transport')
+      if (transport && typeof transport.shutdown === 'function') {
+        transport.shutdown('crash', null, false, () => process.exit(1))
+      } else {
+        process.exit(1)
+      }
     }
   }
 

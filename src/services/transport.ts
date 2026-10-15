@@ -27,7 +27,9 @@ export class TransportConfig {
    * The name this process appears under in prodman's Servers. Each standalone process needs
    * its own name (prodman keeps one connection per name).
    *
-   * default is PM2_MACHINE_NAME, else "<appName>@<hostname>"
+   * default is PM2_MACHINE_NAME, else "<service>@<instance>" in a container and
+   * "<appName>@<hostname>" outside. Placeholders {service}, {instance}, {hostname},
+   * {container}, {task} and {random} are expanded.
    */
   serverName?: string
   /**
@@ -72,6 +74,11 @@ export interface Transport extends EventEmitter2 {
    * Declare options for process
    */
   setOptions: (options: any) => void
+  /**
+   * prodman standalone only: announce a shutdown (`agent:shutdown`), flush and close, then call
+   * `cb` (prodman 11 APM-085)
+   */
+  shutdown?: (reason: 'signal' | 'exit' | 'crash' | 'stop', signal: string | null, planned: boolean, cb?: Function) => boolean
 }
 
 /**
