@@ -45,7 +45,7 @@ io.init({ apmOptions: { sendLogs: true } })   // or set everything here, see bel
 | `url` | `PRODMAN_URL` (then `KEYMETRICS_NODE`) | `http://localhost:8070` |
 | `publicKey`, `secretKey` | `PM2_PUBLIC_KEY`, `PM2_SECRET_KEY` | required (Bucket settings → Connect) |
 | `appName` | `PM2_APP_NAME` | required |
-| `serverName` | `PM2_MACHINE_NAME` | `<appName>@<hostname>` |
+| `serverName` | `PM2_MACHINE_NAME` | `<service>@<instance>` in a container, `<appName>@<hostname>` outside (see [Containers](#containers)) |
 | `sendLogs` | | `false`; logs are also sent while the bucket's "collect logs" is on |
 | `disableLogs` | | `false`; `true` never captures stdout/stderr |
 | `logFilter` | | lines containing this string, or matching this RegExp, are not sent |
@@ -53,8 +53,8 @@ io.init({ apmOptions: { sendLogs: true } })   // or set everything here, see bel
 Notes:
 
 * Each standalone process needs its own server name, because prodman keeps one connection per
-  name. The default `<appName>@<hostname>` is unique per container; set `PM2_MACHINE_NAME` when
-  several copies of an app share a host.
+  name. The defaults are unique per container (`<service>@<instance>`) and per host
+  (`<appName>@<hostname>`); set `PM2_MACHINE_NAME` when several copies of an app share a host.
 * PM2-only remote commands (restart, reload, stop…) answer with an error, since there is no PM2
   to carry them out. `ping` works, and "Logs" shows the last 200 lines the app printed.
 * The connection never keeps the app alive: it exits when its own work is done.
@@ -63,6 +63,64 @@ Notes:
 * Inside PM2 (`pm_id` set) the library always uses IPC, even if the `PM2_*` keys are in the
   environment (as with `pm2-runtime` in Docker).
 * The `proxy` option from upstream is not supported.
+* Prodman shows these servers with the agent kind `@pm2/io` (`status.data.server.agent_kind`) and
+  offers logs, custom actions and profiling, but no PM2 controls.
+
+### Containers
+
+In a container (Docker, Podman, containerd; ECS, Kubernetes or Compose) the library reports like
+pmx-io standalone (pmx `specs/95-containers.md`):
+
+* **Detection**, once at `init()`: `/.dockerenv`, `/run/.containerenv`, `KUBERNETES_SERVICE_HOST`,
+  `ECS_CONTAINER_METADATA_URI_V4`, container paths in `/proc/self/mountinfo` or `/proc/1/cgroup`.
+  Force it with `PMX_CONTAINER=1` (or off with `0`); `PMX_ORCHESTRATOR=ecs|kubernetes|compose|none`
+  overrides the orchestrator. Only Linux is detected automatically.
+* **Identity.** On ECS the task metadata v4 endpoint is read (two requests, 1 s each; the first
+  handshake waits for them at most 1.5 s, the app never waits). The **service** is
+  `PMX_SERVICE_NAME`, else the ECS service name or task family, else the Kubernetes pod name without
+  its Deployment/DaemonSet/Job/StatefulSet suffix (set `POD_NAME` from the downward API; `HOSTNAME`
+  is the fallback), else `COMPOSE_SERVICE`, else `PM2_APP_NAME`. The **instance** is
+  `PMX_INSTANCE_NAME`, else the first 12 characters of the ECS task id, else the pod name, else
+  the first 12 characters of the container id.
+* **Server name:** `<service>@<instance>` (e.g. `orders@3f2a9c1b7d04`) unless `serverName` or
+  `PM2_MACHINE_NAME` is set. Explicit names may use the placeholders `{service}`, `{instance}`,
+  `{hostname}`, `{container}`, `{task}` and `{random}` (4 hex digits per process start), in and
+  outside containers. Names are cut at 200 characters. Upgrading from 7.0 changes the server name of
+  containerised apps once; the old servers are forgotten after the bucket's "forget offline
+  servers" delay.
+* **Status:** `data.server` carries `agent_kind: '@pm2/io'`, `ephemeral` (true in a container unless
+  `PMX_EPHEMERAL=0`; prodman forgets ephemeral servers after they stop) and a `container` block
+  (`runtime`, `orchestrator`, `id`, `name`, `image`, `service`, `instance`, `task`, `cluster`,
+  `namespace`, `revision`, `zone`, `limits { cpus, memoryBytes }`). `PMX_IMAGE` supplies the image
+  outside ECS.
+* **Metrics** describe the container, not the node: the effective CPUs and memory are the smallest of
+  the cgroup quota/limit (v1 or v2), the ECS task limits, the cpuset and the host. `CPU Usage` is
+  relative to the effective CPUs, `RAM Usage`/`RAM Total` to the memory limit, plus `CPU Throttled`,
+  `OOM Kills`, disk, network and filesystem metrics. `cpus` and `total_mem` are the effective limits.
+
+### Shutdowns
+
+The library tells prodman when the app stops on purpose, with an `agent:shutdown` packet
+(`reason`, `signal`, `planned`) followed by a close (code 1000). Prodman retires a planned stop
+quietly and notifies only on unplanned disappearances.
+
+| What happens | `reason` | `planned` |
+|---|---|---|
+| SIGTERM or SIGINT | `signal` | true |
+| the app finished its work (`beforeExit`) | `exit` | true |
+| an uncaught exception ends the app (`catchExceptions`) | `crash` | false |
+| `io.destroy()` (the app keeps running, unreported) | `stop` | true |
+| `process.exit(code)` | `exit` (code 0) or `crash` | best effort: sent synchronously, may not arrive |
+
+* On SIGTERM/SIGINT the library sends the packet and flushes for at most **1 s**. If the app has no
+  listener of its own for that signal, the library then re-raises it, so the process ends exactly as it
+  would have without the library, at most 1 s later (as PID 1, where the kernel ignores a default
+  SIGTERM, it exits with 128 + the signal number). If the app has its own listener, the app decides
+  when to exit. `io.onExit()` callbacks still run. A second signal during the flush cuts it short.
+* SIGKILL and the OOM killer leave no time to report: prodman sees the connection drop and
+  notifies.
+* Outside containers the packet is sent too; prodman then marks the server offline without a
+  notification for planned stops.
 
 ### `PM2_APP_NAME` and `PM2_MACHINE_NAME`
 
@@ -79,11 +137,13 @@ so these two variables supply both:
   identity of the connection (`X-KM-SERVER`). Prodman keeps one live connection per server name,
   so every running copy needs a different one. A second copy with the same name replaces the
   first, and the two keep taking over from each other. When it is not set, the name is
-  `<PM2_APP_NAME>@<hostname>`, which is unique as long as only one copy runs per host or
-  container.
+  `<service>@<instance>` in a container (see [Containers](#containers)) and
+  `<PM2_APP_NAME>@<hostname>` elsewhere, which is unique as long as only one copy runs per host.
 
-For example, two ECS tasks of `orders-api` appear as servers `orders-api@ip-10-0-1-12` and
-`orders-api@ip-10-0-2-34`, and as one application `orders-api` with 2 instances.
+For example, two ECS tasks of the service `orders` running `PM2_APP_NAME=orders-api` appear as
+servers `orders@3f2a9c1b7d04` and `orders@9e81c0d2a4f7` (service and task id), in prodman's
+*Containers* section as `orders` with 2/2 running, and as one application `orders-api` with 2
+instances.
 
 ### Not seeing the app under its `PM2_APP_NAME`?
 
@@ -105,7 +165,8 @@ Otherwise `PM2_APP_NAME` is ignored. Check:
 4. **Did it connect?** A wrong URL keeps it retrying quietly, and wrong keys print
    `[@pm2/io] prodman refused the connection`. Run with `DEBUG=axm:transport:prodman` to see the
    handshake, the URL it uses (`PRODMAN_URL`, default `http://localhost:8070`) and the server name.
-5. **Look under Servers too.** The app's server is `PM2_MACHINE_NAME` (or `<PM2_APP_NAME>@<hostname>`).
+5. **Look under Servers too.** The app's server is `PM2_MACHINE_NAME` (or `<service>@<instance>`
+   in a container, `<PM2_APP_NAME>@<hostname>` elsewhere).
    If it is there but flapping, two copies share a server name; give each its own `PM2_MACHINE_NAME`.
 
 ---
@@ -581,7 +642,8 @@ export class IOConfig {
     /**
      * The name this process appears under in prodman's Servers
      *
-     * default is PM2_MACHINE_NAME, else "<appName>@<hostname>"
+     * default is PM2_MACHINE_NAME, else "<service>@<instance>" in a container, else
+     * "<appName>@<hostname>"
      */
     serverName?: string
     /**

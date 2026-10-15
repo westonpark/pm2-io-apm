@@ -1,6 +1,6 @@
 {
   "name": "@pm2/io",
-  "version": "7.0.0",
+  "version": "7.1.0",
   "description": "PM2 APM for Node.js, reporting to prodman",
   "main": "build/main/index.js",
   "typings": "build/main/index.d.ts",
