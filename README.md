@@ -13,6 +13,12 @@
 
 This fork of `@pm2/io` reports to a [prodman](https://github.com/westonpark/prodman) server.
 
+> **Recommended instead: [`@aidra/pmx-io`](https://www.npmjs.com/package/@aidra/pmx-io)**, pmx's
+> instrumentation library. It has the same API and environment variables, works standalone, under
+> pmx and under PM2, and adds tracing, Bun and child-process reporting. Existing code keeps
+> `require('@pm2/io')` with `npm install @pm2/io@npm:@aidra/pmx-io`. This fork remains for those
+> who need an Apache-2.0 library.
+
 * **Apps run by PM2 (pm2_prodman):** nothing changes. The library talks to the PM2 daemon over
   IPC and the daemon's agent forwards everything to prodman.
 * **Apps run without PM2** (a container's `node app.js`, ECS tasks, workers): the library connects
